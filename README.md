@@ -4,7 +4,7 @@
 
 支持一次请求生成 **2～5 份平行卷**（`paper_count`）：所有卷在同一个 CP-SAT 联合模型中分别满足全部单卷约束，并限制任意两卷共同题数不超过 `max_shared_questions`；多卷可行解按 **各卷难度偏差总和 → 跨卷重复题总数 → 各卷题号序列** 依次择优，无解时冲突集区分**单卷约束**（`per_paper`）与**跨卷重叠上限**（`cross_paper`）。不传 `paper_count` 时为单卷，请求与响应结构完全保持兼容。
 
-还支持一次请求返回 **1～5 个候选卷组**（`alternative_count`，缺省 `1`）：在同一冻结题库与原约束下，按上述既有择优规则依次给出排名候选；后续候选与此前每个候选的**每张对应卷**至少有 `min_question_changes`（多候选缺省 `1`）道题不同，且多卷时**不能仅靠交换卷序**制造新候选。差异约束只增不删、绝不放宽原约束；候选不足时返回实际数量与 `exhausted: true`。`alternative_count` 缺省（或为 `1`）时响应结构与旧版完全一致。
+还支持一次请求返回 **1～5 个候选卷组**（`alternative_count`，缺省 `1`）：在同一冻结题库与原约束下，按上述既有择优规则依次给出排名候选；后续候选与此前每个候选的**每张对应卷**至少有 `min_question_changes`（多候选缺省 `1`）道题不同，且多卷时**不能仅靠交换卷序**制造新候选。差异约束只增不删、绝不放宽原约束；**每个候选的每个择优阶段（含题号破平的每个分块）都必须取得最优性证明才会输出**——只在累计差异约束下**被证明无解**时才停止并置 `exhausted: true`，限时内无法证明最优或无法判定时整个任务以 `error` 结束（不返回部分候选）。`alternative_count` 缺省（或为 `1`）时响应结构与旧版完全一致。
 
 此外支持对已完成且可行的任务**定向改卷**（`POST /api/tasks/{task_id}/revise`）：按卷指定必须保留/移除的题号，联合重求解全部卷并在满足原约束的前提下**最大化各卷保留原题总数**，详见下文[定向改卷](#定向改卷post-apitaskstask_idrevise)。
 
@@ -79,6 +79,51 @@ EXAM_DB_PATH=./exam.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 任务状态：`pending` → `running` → `done`；结果在 `result` 字段中返回（`feasible` / `infeasible` / `error` / `quota_exceeded`）。状态为 `done` 的任务（及其已冻结成绩批次）在任何接管扫描中都不会被重新执行；服务退出时遗留的 `pending` / `running` 任务由[崩溃恢复与任务接管](#崩溃恢复与任务接管post-apitasksrecover)自动收敛。
 
+## 本轮用法及调用示例
+
+组卷结果判定本轮统一为：**普通任务、模板实例化任务（`POST /api/templates/{id}/tasks`）、定向改卷任务（`POST /api/tasks/{id}/revise`）共用同一求解入口与同一判定**——按原约束及既定择优顺序，只有**各层目标与题号破平都取得最优性证明**才返回可行卷；多候选的后续轮次也须在**累计差异约束**下证明最优，只有**证实无解**才标记 `exhausted: true`。任一阶段限时内无法证明时任务以既有 `error` 结果完成：**不返回部分候选、不扣曝光配额，带租约时作废（void）预留**，结算与[防篡改审计链](#防篡改审计链)保持一致；首轮即被证明无解时保留既有 `infeasible` 冲突结果。任务查询结构（`GET /api/tasks/{id}`）、单候选响应结构与启动接管行为均保持不变。
+
+典型调用与结果处理（三类任务的创建路径不同，查询与判定完全相同）：
+
+```bash
+# 1) 创建（普通任务；模板实例化、定向改卷见对应章节，返回结构同为 {"task_id", "status"}）
+curl -X POST http://localhost:8000/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"questions": [ /* 题库快照 */ ], "total_score": 100,
+       "difficulty_range": [0.4, 0.6], "target_difficulty": 0.5,
+       "alternative_count": 3, "seed": 42}'
+# -> 201 {"task_id": 12, "status": "pending"}
+
+# 2) 轮询直到 done
+curl http://localhost:8000/api/tasks/12
+```
+
+- `result.status = "feasible"`：全部择优层级（多候选时含每一轮的累计差异约束）均已证明最优；单候选响应结构与旧版一致，多候选见 `alternatives` / `exhausted`。只有此状态会进入配额结算。
+- `result.status = "infeasible"`：首轮即证明无解，返回 `conflict_constraints` 最小冲突集；配额不扣减，租约 `void`。
+- `result.status = "error"`：某阶段限时内无法证明最优或无法判定，`result` 仅含 `error`（改卷任务另含 `source_task_id`），**没有任何卷或候选数据**；配额不扣减，租约 `void`。该结果可稍后原样重试（请求与种子不变，结果可复现）。
+- `result.status = "quota_exceeded"`：卷已证明最优但曝光余额不足，整组未扣减，附 `shortages`；租约 `void`。
+
+```bash
+# 3) error 结果示例（轮询返回，任务已是 done）
+# {"task_id": 12, "status": "done",
+#  "result": {"status": "error",
+#             "error": "求解器在规定时间内无法证明题号序列分块的字典序最优"}}
+
+# 4) 多候选“证实无解才穷尽”示例：alternatives 全部已证明最优，exhausted 仅此时为 true
+# {"status": "feasible", "alternative_count": 3, "returned_count": 2,
+#  "exhausted": true, "alternatives": [ {"rank": 1, ...}, {"rank": 2, ...} ]}
+
+# 5) 带租约任务遇到 error：租约直接 void，确认接口返回 code=void（不释放/扣减任何配额）
+curl -X POST http://localhost:8000/api/tasks/12/quota/confirm \
+  -H "Content-Type: application/json" \
+  -d '{"reservation_token": "<创建任务时一次性返回>"}'
+# -> 422 {"detail": {"message": "预留当前不可确认", "code": "void", "lease": {...}}}
+
+# 6) 审计链对 error/void 同样闭合（finished -> quota_settled{outcome:"void"}）
+curl http://localhost:8000/api/tasks/12/audit
+# -> {"valid": true, "events": [created, started, finished, quota_settled], ...}
+```
+
 ## 请求示例
 
 ```bash
@@ -145,11 +190,13 @@ curl -X POST http://localhost:8000/api/tasks \
   }'
 ```
 
-择优顺序（逐层最优后再优化下一层，保证确定性、与卷的排列无关）：
+择优顺序（逐层证明最优后再优化下一层，保证确定性、与卷的排列无关）：
 
 1. **各卷难度偏差总和**最小；
 2. **跨卷重复题总数**（所有卷对共同题数求和）最少；
 3. **各卷题号序列**按卷序依次最小（同时唯一确定卷的排列）。
+
+> **最优性保证（仅证明最优才返回可行卷）**：三个择优层级逐层求解并固定已证明的最优值，题号序列进一步按规范题号序**逐分块**求字典序最小。只有每一层目标、以及题号破平的**每一个分块**都从求解器取得 `OPTIMAL`（已证明最优）时，才返回 `feasible` 卷。任一阶段在限时内**只找到可行解而未证明最优**（或完全无法判定）时，任务以 `status: "error"` 完成，**不携带 `selected_ids` / `papers` 等任何部分卷**，也不进入配额结算——因为只“可行”的卷可能难度偏差并非最小、后续层级未被优化，或题号序列尚未完成字典序破平。普通任务、模板实例化任务与定向改卷任务（含其“保留源卷原题最大化”第 0 层）均遵循同一判定；首轮即被**证明无解**时仍返回既有 `infeasible` 最小冲突约束集。
 
 ### 多卷可行结果
 
@@ -211,12 +258,13 @@ curl -X POST http://localhost:8000/api/tasks \
 
 在任意单卷/多卷请求上增加 `alternative_count`（及可选 `min_question_changes`），即可在**同一冻结题库、同一组原始约束**下一次取回多个候选卷组。求解过程：
 
-1. 第 1 个候选按既有择优规则（单卷：难度偏差 → 重复知识点 → 题号序列；多卷：难度偏差总和 → 跨卷重复题 → 题号序列）求出；
-2. 此后每轮**只追加、从不放宽**两类差异约束后重新分层择优：
+1. 第 1 个候选按既有择优规则（单卷：难度偏差 → 重复知识点 → 题号序列；多卷：难度偏差总和 → 跨卷重复题 → 题号序列）完成全部分层择优，**每个层级与题号破平分块都证明最优**；
+2. 此后每轮**只追加、从不放宽**两类差异约束后重新分层择优（同样要求每阶段证明最优）：
    - **逐卷差异**：新候选的第 `p` 卷与此前**每个**候选的第 `p` 卷至少有 `min_question_changes` 道题不同（对单卷任务即整张卷的差异）；
    - **禁止卷序重排**（多卷）：不存在任何卷排列能让新候选与旧候选逐卷重合——不能只把 A/B 卷换个顺序充当新候选；
 3. 全部候选共用同一 `seed`、单线程确定性求解，候选顺序可复现；
-4. 某一轮在全部原约束 + 累计差异约束下无解（或限时内无法判定）时立即停止，返回已找到的实际数量并置 `exhausted: true`，**不会为凑数放宽任何约束**。
+4. 某一轮在全部原约束 + 累计差异约束下被**证明无解（INFEASIBLE）**时立即停止，返回此前各轮已证明最优的实际候选数量并置 `exhausted: true`，**不会为凑数放宽任何约束**；
+5. 若某一轮在限时内**无法证明最优**（求解器只给出 `FEASIBLE` 可行解）或**无法判定**（`UNKNOWN`），整个任务以 `status: "error"` 完成——**不返回任何部分候选**，因此 `exhausted` 只会在“已证明无更多候选”时为 `true`，绝不会把超时误报为候选穷尽。
 
 ### 请求示例（单卷任务取 3 个候选）
 
@@ -301,11 +349,40 @@ curl -X POST http://localhost:8000/api/tasks \
 字段说明：
 
 - `alternative_count`：请求的候选数量；`returned_count`：实际返回数量；
-- `exhausted`：候选是否已穷尽——`true` 表示在不放宽任何原约束的前提下无法再给出满足差异要求的候选（`returned_count < alternative_count` 时恒为 `true`）；
+- `exhausted`：候选是否已穷尽——`true` 表示在不放宽任何原约束的前提下，已在累计差异约束下**证明**无法再给出满足差异要求的候选（`returned_count < alternative_count` 时恒为 `true`）；限时内无法证明最优或无法判定时任务直接以 `error` 结束，不会出现“部分候选 + exhausted”的结果；
 - `min_question_changes`：本次实际采用的逐卷最少差异题数（回显缺省值）；
 - `alternatives[i].rank`：从 1 起的择优排名；排名仅依据既有择优规则，候选间的差异约束不参与排序。
 
 > 多候选任务同样可以发起[定向改卷](#定向改卷post-apitaskstask_idrevise)：以排名第 1（择优最优）的候选为基准卷冻结；改卷任务始终只返回一个新卷组（差异最大化择优），不再产生多候选。
+
+### 限时场景（`error`，不返回未证明最优的卷）
+
+组卷为异步任务，求解器对**每个择优阶段**（定向改卷的保留最大化、难度偏差、重复知识点/跨卷重复题，以及题号序列的每个破平分块；多候选时对每个候选重复整套流程）分别设置求解限时（单线程、固定种子）。普通、模板实例化与定向改卷三类任务的结果判定完全一致：
+
+- 全部阶段都取得 `OPTIMAL`：任务 `done` 且 `result.status = "feasible"`，只有此时才可能扣减曝光配额、激活预留租约；
+- 首轮即被**证明无解**：保留既有 `infeasible` 结果与逐项删减验证的最小冲突约束集；
+- 任一阶段限时内**只找到可行解而未证明最优**，或完全无法判定：任务仍正常收敛为 `done`，但 `result.status = "error"`，结果**只含 `error` 诊断信息**（改卷任务另含 `source_task_id`），**不含 `selected_ids` / `papers` / `alternatives` 等任何部分卷**。多候选任务在第 2 个及以后候选上出现该情况时同样整个任务 `error`，**不返回此前已求得的部分候选**——它们尚不能证明在累计差异约束下持续最优；
+- 后续候选在累计差异约束下被**证明无解**才停止：返回已证明最优的候选并置 `exhausted: true`。
+
+`error` 任务可由调用方稍后原样重试（请求与种子不变，结果可复现；一旦全部阶段证明最优即返回可行卷）。结算侧行为与该判定严格一致：
+
+- **不扣任何曝光配额**（结果非 `feasible`，不产生 `quota_reservations` 记录）；
+- 带 `lease_seconds` 预留租约的任务，其 awaiting 租约在结算同事务置为 **`void`**（不会悬置，也不会被错误激活）；
+- 审计链照常闭合：`finished` 事件记录 `result_status=error`，配额任务追加 `quota_settled`（`outcome=void`），与业务表交叉一致。
+
+```json
+{
+  "status": "error",
+  "error": "求解器在规定时间内无法证明各卷难度偏差总和的最优值"
+}
+```
+
+不同阶段未完成证明时，`error` 信息会定位到具体层级，例如：
+
+- `"求解器在规定时间内无法证明各卷保留源卷原题总数的最优值"`（定向改卷第 0 层）；
+- `"求解器在规定时间内无法证明重复知识点数的最优值"`（单卷第 2 层）；
+- `"求解器在规定时间内无法证明跨卷重复题总数的最优值"`（多卷第 2 层）；
+- `"求解器在规定时间内无法证明题号序列分块的字典序最优"`（题号破平）。
 
 ## 定向改卷（`POST /api/tasks/{task_id}/revise`）
 
@@ -321,6 +398,8 @@ curl -X POST http://localhost:8000/api/tasks \
   2. 各卷难度偏差总和（单卷为自身偏差）最小；
   3. 跨卷重复题总数（单卷为重复知识点数）最少；
   4. 各卷题号序列最小。
+
+  四个层级与题号破平的每个分块同样**必须逐层证明最优**：任一阶段限时内只找到可行解而未证明最优时，改卷任务以 `status: "error"` 完成（不返回新卷、不扣配额，带租约时作废预留，仍保留 `source_task_id` 溯源），详见上文[限时场景](#限时场景error不返回未证明最优的卷)。
 
 ```bash
 curl -X POST http://localhost:8000/api/tasks/42/revise \

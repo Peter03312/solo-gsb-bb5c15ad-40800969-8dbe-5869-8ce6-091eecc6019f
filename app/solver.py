@@ -26,15 +26,18 @@ cross_paper 为跨卷重叠上限（kind=shared_questions）。
 同样可进入最小冲突集，其 detail 可定位到卷与题号（paper + question_id）。
 
 多候选（alternative_count 2~5）：在同一冻结题库与原约束（含全部单卷约束与跨卷
-重叠上限）下迭代求解。每个候选都独立跑完整的分层择优；候选 k+1 在候选 1..k 之上
-追加两类差异约束：
+重叠上限）下迭代求解。每个候选都独立跑完整的分层择优，且**每个择优阶段
+（含题号破平的每个分块）都必须取得 OPTIMAL 最优性证明**——只找到可行解而未
+证明最优等同于未判定，整个任务以 error 结束，绝不输出未经最优性证明的卷。
+候选 k+1 在候选 1..k 之上追加两类差异约束：
   1. 逐卷差异：其第 p 卷与此前每个候选的第 p 卷至少有 min_question_changes
      道题不同（对称差），即“每张对应卷都要改够数量”；
   2. 禁止重排（仅多卷）：不得与此前任何候选构成“卷序重排”关系
      ——不存在任何卷排列使卷集合完全重合，杜绝仅靠交换卷序制造的新候选。
-差异约束只增不删、不放宽任何原始约束；后续候选一旦无解/无法在限时内判定，
-立即停止并返回实际数量与 exhausted=true。全部迭代共用同一 seed、单线程求解，
-候选顺序确定且可复现。
+差异约束只增不删、不放宽任何原始约束；后续候选只有在累计差异约束下被**证明
+无解（INFEASIBLE）**时才停止并以 exhausted=true 返回此前已证明最优的候选；
+限时内无法判定（即便已有可行解）时任务以 error 结束，不返回部分候选。
+全部迭代共用同一 seed、单线程求解，候选顺序确定且可复现。
 """
 from __future__ import annotations
 
@@ -484,11 +487,29 @@ def _repeat_expr(
     return sum(repeat_vars) if repeat_vars else 0
 
 
+def _stage_state(status: int) -> str:
+    """把 CP-SAT 状态归一为 optimal / infeasible / unknown 三态。
+
+    FEASIBLE（只找到可行解、未证明最优）一律归入 unknown：择优层未取得
+    最优性证明时不得固定该层值，更不得把整卷当作最终结果输出。
+    """
+    if status == cp_model.OPTIMAL:
+        return "optimal"
+    if status == cp_model.INFEASIBLE:
+        return "infeasible"
+    return "unknown"
+
+
 def _optimize(
     d: Dict[str, Any],
     exclusions: Optional[List[List[List[bool]]]] = None,
 ) -> Tuple[str, Optional[List[List[bool]]], Optional[str]]:
-    """字典序分层择优，逐阶段固定已得到的最优值。
+    """字典序分层择优，逐阶段固定**已证明**的最优值。
+
+    每个阶段（含题号破平的每个分块）都必须取得 OPTIMAL：只找到可行解而未
+    证明最优（FEASIBLE）或完全无法判定（UNKNOWN/MODEL_INVALID 等）时，立即
+    返回 ("unknown", None, 诊断信息)，绝不固定该层值、绝不携带部分选择返回。
+    只有全部层级与全部破平分块都证明最优后才返回 ("feasible", 选择, None)。
 
     exclusions 为多候选迭代中此前各候选：在所有阶段模型中一视同仁地追加，
     因此新候选是“与此前候选都足够不同”的解中按同一择优规则选出的最优者。
@@ -498,20 +519,26 @@ def _optimize(
     active = set(range(len(d["specs"])))
     revise = d.get("revise", False)
 
+    def chosen_of(
+        solver: cp_model.CpSolver, x: List[List[cp_model.IntVar]]
+    ) -> List[List[bool]]:
+        return [[bool(solver.Value(x[p][i])) for i in range(n)] for p in range(P)]
+
     # 定向改卷阶段 0：最大化各卷保留源卷原题的总数（先满足全部约束，再谈保留）
     best_retained: Optional[int] = None
+    chosen: Optional[List[List[bool]]] = None
     if revise:
         m, x, extra = _build_model(d, active, exclusions)
         m.Maximize(extra["retained_total"])
         s = _solver(d)
         s.parameters.max_time_in_seconds = STAGE_TIME_LIMIT
-        status = s.Solve(m)
-        if status == cp_model.INFEASIBLE:
+        state = _stage_state(s.Solve(m))
+        if state == "infeasible":
             return "infeasible", None, None
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            return "unknown", None, "求解器在规定时间内无法判定可行性"
+        if state != "optimal":
+            return "unknown", None, "求解器在规定时间内无法证明各卷保留源卷原题总数的最优值"
         best_retained = int(s.Value(extra["retained_total"]))
-        chosen = [[bool(s.Value(x[p][i])) for i in range(n)] for p in range(P)]
+        chosen = chosen_of(s, x)
 
     # 阶段 1：各卷难度偏差（单卷即其自身偏差）最小
     m, x, extra = _build_model(d, active, exclusions)
@@ -520,13 +547,13 @@ def _optimize(
     m.Minimize(extra["total_dev"])
     s = _solver(d)
     s.parameters.max_time_in_seconds = STAGE_TIME_LIMIT
-    status = s.Solve(m)
-    if status == cp_model.INFEASIBLE:
+    state = _stage_state(s.Solve(m))
+    if state == "infeasible":
         return "infeasible", None, None
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return "unknown", None, "求解器在规定时间内无法判定可行性"
+    if state != "optimal":
+        return "unknown", None, "求解器在规定时间内无法证明各卷难度偏差总和的最优值"
     best_dev = int(s.Value(extra["total_dev"]))
-    chosen = [[bool(s.Value(x[p][i])) for i in range(n)] for p in range(P)]
+    chosen = chosen_of(s, x)
 
     # 阶段 2：单卷最小化重复知识点数；多卷最小化跨卷重复题总数
     m, x, extra = _build_model(d, active, exclusions)
@@ -535,23 +562,26 @@ def _optimize(
     m.Add(extra["total_dev"] == best_dev)
     if P == 1:
         objective_2 = _repeat_expr(m, d, x[0], "p0")
+        second_name = "重复知识点数"
     else:
         objective_2 = extra["shared_total"]
+        second_name = "跨卷重复题总数"
     m.Minimize(objective_2)
     s = _solver(d)
     s.parameters.max_time_in_seconds = STAGE_TIME_LIMIT
-    status = s.Solve(m)
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        best_second = int(s.Value(objective_2))
-        chosen = [[bool(s.Value(x[p][i])) for i in range(n)] for p in range(P)]
-    else:
-        # 退化：直接使用阶段 1 的解
-        best_second = 0
+    state = _stage_state(s.Solve(m))
+    # 此前各层已有可行见证且本层模型只增固定等式：INFEASIBLE 只可能来自
+    # 求解器数值异常，按“未能证明”处理，绝不退化为任意可行解。
+    if state != "optimal":
+        return "unknown", None, f"求解器在规定时间内无法证明{second_name}的最优值"
+    best_second = int(s.Value(objective_2))
+    chosen = chosen_of(s, x)
 
     # 阶段 3：题目编号序列最小（沿用单卷既定编码，保证单卷结果不变）。
     # 规范化排序后的 0/1 选择向量按 2^q（q 为规范题号序）分块，逐块最小化；
     # 多卷时分块严格落在单卷内部（不跨卷边界），按 (卷序, 块序) 逐块最小化并
     # 固定此前各块。由此卷间对称被唯一破缺（各卷按同一确定性顺序择优），结果可复现。
+    # 每个分块都必须证明最优：任一破平分块未证明时整卷不输出。
     n_chunks_paper = (n + CHUNK_BITS - 1) // CHUNK_BITS
     fixed_chunks: List[Tuple[int, int, int]] = []  # (卷 p, 块 k, 块值)
     total_steps = P * n_chunks_paper
@@ -577,11 +607,11 @@ def _optimize(
 
         s = _solver(d)
         s.parameters.max_time_in_seconds = STAGE_TIME_LIMIT
-        status = s.Solve(m)
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            break  # 保留上一阶段已得的最优解
+        state = _stage_state(s.Solve(m))
+        if state != "optimal":
+            return "unknown", None, "求解器在规定时间内无法证明题号序列分块的字典序最优"
         fixed_chunks.append((p, k, int(s.Value(e_k))))
-        chosen = [[bool(s.Value(x[pp][i])) for i in range(n)] for pp in range(P)]
+        chosen = chosen_of(s, x)
 
     return "feasible", chosen, None
 
@@ -669,26 +699,35 @@ def _solve_prepared(d: Dict[str, Any]) -> Dict[str, Any]:
 
     alt_count = max(1, d.get("alt_count", 1))
     candidates: List[List[List[bool]]] = []
-    # 迭代加入差异约束：每个候选都在原约束 + 对此前所有候选的差异约束下择优。
-    # 差异约束只增不删，绝不放宽任何原约束；某一轮无解即候选穷尽。
+    # 迭代加入差异约束：每个候选都在原约束 + 对此前所有候选的差异约束下完成
+    # 全部分层择优（每阶段须证明最优）。差异约束只增不删，绝不放宽任何原约束。
     for k in range(alt_count):
         status, chosen, note = _optimize(d, candidates)
         if status == "feasible":
             candidates.append(chosen)  # type: ignore[arg-type]
             continue
         if k == 0:
-            # 首个候选即无解：原始约束无解，给最小冲突集
+            # 首个候选：原始约束被证明无解 -> 最小冲突集；无法判定 -> error
             if status == "unknown":
-                return {"status": "error", "error": note or "求解超时，无法判定可行性"}
+                return {"status": "error", "error": note or "求解超时，无法证明最优性"}
             conflicts, mnote = _minimal_conflicts(d)
             return _infeasible_result(d, conflicts, mnote)
-        # 后续候选无解（或限时内无法判定）：停止迭代，返回实际数量并标记穷尽；
-        # unknown 同样保守视为穷尽，不放宽约束、不臆造候选。
+        # 后续候选：
+        # - 仅当在累计差异约束下被**证明无解**时才标记候选穷尽，返回此前各轮
+        #   已证明最优的候选（exhausted=true）；
+        # - 限时内无法判定（哪怕求解器已持有可行解）一律以 error 结束整任务，
+        #   绝不把超时误报为“无更多候选”，也不返回可能未证明最优的部分候选。
+        if status == "unknown":
+            return {
+                "status": "error",
+                "error": note
+                or f"第 {k + 1} 个候选在限时内无法证明最优性或无解，任务终止",
+            }
         break
 
     if not candidates:
-        # 首个候选超时（_quick_infeasible 未预判到）
-        return {"status": "error", "error": "求解超时，无法判定可行性"}
+        # 防御性兜底：正常流程下首候选 unknown/infeasible 已在上方返回
+        return {"status": "error", "error": "求解超时，无法证明最优性"}
 
     if len(candidates) == 1 and alt_count == 1:
         # 单候选：响应结构与旧版完全一致
